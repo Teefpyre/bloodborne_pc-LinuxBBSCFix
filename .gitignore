@@ -34,5 +34,4 @@ patches.json
 # Local build, binaries, and external reference dirs
 .local_build/
 bin/
-Original/
 Windows files/

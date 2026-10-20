@@ -1,4 +1,31 @@
 THIS PROJECT IS NOT RELATED TO SHADPS4. ALL QUESTIONS RELATED TO THIS PROJECT SHOULD BE SENT TO THE DISCORD SERVER https://discord.gg/KYZRKk9CB, NOT TO THE SHADPS4 SERVER.
+THIS PROJECT IS TEMPORARY AND WILL LIKELY GET MERGED WITH UPSTREAM. @Baguetta FOR ISSUES NOT DEADINSIDE
+
+
+## Bloodborne PC (Linux bbport 0.6) - Seamless Co-op Fix
+
+### What's Changed
+- **Seamless Co-op Bells Fix**: Automatically grants the Beckoning Bell, Small Resonant Bell, Silencing Blank, and Sinister Resonant Bell on player spawn.
+- **Cross-Platform Play**: Full compatibility between Linux and Windows clients connected on Shadnet.
+- **Small Performance Fix**: Cached low-memory region queries, eliminating Vulkan `mmap_lock` contention and random 15 FPS dips.
+- **Launcher UI**: Seamless co-op toggles and server selection in the launcher.
+- **Size Optimized**: High-ratio xz compression (371 MB).
+
+### How to Run
+1. Download `Bloodborne-bbport-x86_64.AppImage` on releases tab.
+2. Make it executable: `chmod +x Bloodborne-bbport-x86_64.AppImage`
+3. Run: `./Bloodborne-bbport-x86_64.AppImage`
+4. Make sure to point your Game folder to your Bloodborne dump directory. (Only 1.09 GOTY CUSA03173 supported)
+
+**NOTE: Make sure your Network engine is set to shadp2p to play.** Protocol 20 left for compatibility.
+
+### What is and isn't tested
+TESTED: Basic p2p connection between linux/linux and linux/windows clients (Windows client used https://install.seamlesshunt.com/shadps4.html)
+Progression, bosses, invasion, password matching, harder enemies
+
+UNTESTED/BROKEN: Pvp for co op seems to induce desyncs, don't use it
+Vertex explosions potentially introduced in the branch
+BBPort for linux and/or other windows clients not tested!
 
 
 # bbport — a native Linux port of Bloodborne
