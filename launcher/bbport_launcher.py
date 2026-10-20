@@ -208,6 +208,7 @@ DEFAULTS = {
     # BBSC, Bloodborne seamless co-op (seamlesshunt.com): needs a server running its
     # game server next to shadNet (Seamless Hunt's does).
     "online_bbsc": True,
+    "online_net_gen": "19",
     "online_community": online.COMMUNITY_SERVER,
     "online_server": online.SHADNET_SERVER,
     "online_webapi": online.WEBAPI_SERVER,
@@ -356,8 +357,8 @@ def fsr411_build_command(upscaler, loader=None):
 def online_module(pool="seamless"):
     """The online module beside the GPU library (gpu/bbnet, or gpu/bbnet20 for the shadNet and The
     Hunter's Dream pools; a build without its libraries has none)."""
-    name = "libbbnet20.so"
-    return (PORT_DIR / ("bin" if PACKAGED else "out") / "gpu" / name).is_file()
+    gpu_dir = PORT_DIR / ("bin" if PACKAGED else "out") / "gpu"
+    return (gpu_dir / "libbbnet20.so").is_file() or (gpu_dir / "libbbnet.so").is_file()
 
 
 def game_environment(s):
@@ -434,9 +435,10 @@ def game_environment(s):
         env["BB_SHADNET_PASSWORD"] = s["online_password"]
         env["BB_UPNP"] = "1" if s["online_upnp"] else "0"
         env["BB_COMMUNITY_SERVER"] = community
-        env["BB_NET_GEN"] = "20"
-        if pool == "seamless" and s.get("online_bbsc"):
-            env["BB_BBSC"] = "1"
+        if "BB_NET_GEN" not in env:
+            env["BB_NET_GEN"] = str(s.get("online_net_gen") or "19")
+        if pool == "seamless":
+            env["BB_BBSC"] = "1" if s.get("online_bbsc", True) else "0"
         if pool == "huntersdream":
             # run.sh turns these into the backend's addresses and the host overrides.
             env["BB_NET_BACKEND"] = "thd"
@@ -1232,6 +1234,7 @@ class LauncherWindow(Adw.ApplicationWindow):
         s["mods_enabled"] = self.mods_enabled_row.get_active()
         s["online"] = self.online_row.get_active()
         s["online_bbsc"] = self.bbsc_row.get_active()
+        s["online_net_gen"] = combo_value(self.net_gen_row)
         s["online_community"] = self.community_row.get_text().strip()
         s["online_server"] = self.server_row.get_text().strip()
         s["online_webapi"] = self.webapi_row.get_text().strip()
@@ -1425,6 +1428,16 @@ class LauncherWindow(Adw.ApplicationWindow):
                         "Нужен сервер с игровым сервером BBSC, у всех игроков включено"),
             active=s.get("online_bbsc", False))
         coop.add(self.bbsc_row)
+        self.net_gen_row = combo_row(
+            tr("Сетевой модуль"),
+            tr("Версия сетевого модуля"),
+            (
+                (tr("shadp2p / Windows BBSC (Gen 19)"), "19", tr("Сетевой модуль shadp2p, полностью совместимый с Windows Seamless Hunt (BBSC v0.0.1)")),
+                (tr("shadPS4 0.20 (Gen 20)"), "20", tr("Стек shadPS4 0.20")),
+            ),
+            s.get("online_net_gen", "19")
+        )
+        coop.add(self.net_gen_row)
         self.coop_group = coop
         page.add(coop)
 
@@ -1437,6 +1450,13 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.password_row = Adw.PasswordEntryRow(title=tr("Пароль"), text=s["online_password"])
         account.add(self.npid_row)
         account.add(self.password_row)
+        self.create_account_button = Gtk.Button(label=tr("Создать аккаунт на сервере"), valign=Gtk.Align.CENTER)
+        self.create_account_button.add_css_class("suggested-action")
+        self.create_account_button.connect("clicked", self.on_create_shadnet_account)
+        self.create_account_row = Adw.ActionRow(title=tr("Регистрация"))
+        self.create_account_row.set_subtitle(tr("Создать новую учётную запись на сервере shadNet с указанными именем и паролем"))
+        self.create_account_row.add_suffix(self.create_account_button)
+        account.add(self.create_account_row)
         self.account_group = account
         page.add(account)
 
@@ -1565,6 +1585,31 @@ class LauncherWindow(Adw.ApplicationWindow):
                 return
             GLib.idle_add(done, name, token, "")
         threading.Thread(target=work, daemon=True).start()
+
+    def on_create_shadnet_account(self, _button):
+        npid = self.npid_row.get_text().strip()
+        pwd = self.password_row.get_text()
+        if not npid or not pwd:
+            self.alert("Bloodborne", tr("Укажите желаемое имя учётной записи (Online ID) и пароль"))
+            return
+        server = self.server_row.get_text().strip() or online.SHADNET_SERVER
+        self.create_account_button.set_sensitive(False)
+
+        def worker():
+            ok, msg = online.create_shadnet_account(server, npid, pwd)
+
+            def done():
+                self.create_account_button.set_sensitive(True)
+                if ok:
+                    self.toasts.add_toast(Adw.Toast(title=tr("Аккаунт успешно создан на сервере!")))
+                    self.store()
+                else:
+                    self.alert("Bloodborne", msg)
+                return False
+
+            GLib.idle_add(done)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def online_addresses(self):
         server = self.server_row.get_text().strip() or online.SHADNET_SERVER
@@ -1721,6 +1766,25 @@ class LauncherWindow(Adw.ApplicationWindow):
                                         "зарегистрированное на сервере, а не адрес email"))
             self.stack.set_visible_child_name("online")
             return
+        if (self.online_row.get_active() and self.online_pool() == "seamless" and
+            self.bbsc_row.get_active() and not self.npid_row.get_text().strip() and
+            hasattr(Adw, "AlertDialog")):
+            dialog = Adw.AlertDialog(
+                heading="Bloodborne",
+                body=tr("Учётная запись (Online ID) не указана. Без аккаунта колокола и совместная игра BBSC не смогут подключиться к другим игрокам. Перейти к настройке аккаунта?")
+            )
+            dialog.add_response("setup", tr("Настроить аккаунт"))
+            dialog.add_response("continue", tr("Запустить всё равно"))
+            dialog.set_response_appearance("setup", Adw.ResponseAppearance.SUGGESTED)
+
+            dialog.connect(
+                "response",
+                lambda _d, r: self.stack.set_visible_child_name("online") if r == "setup" else self.do_start_game())
+            dialog.present(self)
+            return
+        self.do_start_game()
+
+    def do_start_game(self):
         self.store()
         self.log_view.get_buffer().set_text("")
         launcher = Gio.SubprocessLauncher.new(

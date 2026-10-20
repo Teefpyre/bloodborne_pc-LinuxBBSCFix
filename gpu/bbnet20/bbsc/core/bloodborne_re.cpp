@@ -5565,6 +5565,14 @@ std::optional<BbscSaveSlot> BbscActiveSaveSlotUnchecked() {
     // As shadPS4 picks its user folder: <working folder>\user when it exists (portable install),
     // else %APPDATA%\shadPS4 - never both (another window may play from the other one).
     std::vector<fs::path> bases{fs::current_path(ec) / "user"};
+    for (const char* env_name : {"BB_GPU_USER_DIR", "BB_USER_DIR"}) {
+        if (const char* env_val = std::getenv(env_name); env_val != nullptr && env_val[0]) {
+            const fs::path env_path(env_val);
+            if (std::ranges::find(bases, env_path) == bases.end()) {
+                bases.push_back(env_path);
+            }
+        }
+    }
 #ifdef _WIN32
     if (!fs::is_directory(bases.front() / "home", ec) &&
         !fs::is_directory(bases.front() / "savedata", ec)) {
@@ -5590,6 +5598,25 @@ std::optional<BbscSaveSlot> BbscActiveSaveSlotUnchecked() {
             ec.clear();
         }
     }
+    const auto check_user_titles = [&](const fs::path& parent, const std::string& slot_user) {
+        std::error_code title_ec;
+        for (const auto& title : fs::directory_iterator(parent, title_ec)) {
+            const fs::path dir = title.path() / "SPRJ0005";
+            if (!fs::is_directory(dir, ec)) {
+                ec.clear();
+                continue;
+            }
+            for (int slot = 0; slot < 10; ++slot) {
+                const fs::path file = dir / fmt::format("userdata{:04}", slot);
+                const auto written = fs::last_write_time(file, ec);
+                if (!ec && written > best_time) {
+                    best_time = written;
+                    best = BbscSaveSlot{slot_user, slot};
+                }
+                ec.clear();
+            }
+        }
+    };
     for (const fs::path& base : bases) {
         for (const auto& user : fs::directory_iterator(base / "home", ec)) {
             const std::string name = user.path().filename().string();
@@ -5599,35 +5626,17 @@ std::optional<BbscSaveSlot> BbscActiveSaveSlotUnchecked() {
             if (!BbscProcessUserId().empty() && name != BbscProcessUserId()) {
                 continue; // another window's character on this PC
             }
-            const fs::path dir = user.path() / "savedata" / "CUSA00207" / "SPRJ0005";
-            for (int slot = 0; slot < 10; ++slot) {
-                const fs::path file = dir / fmt::format("userdata{:04}", slot);
-                const auto written = fs::last_write_time(file, ec);
-                if (!ec && written > best_time) {
-                    best_time = written;
-                    best = BbscSaveSlot{name, slot};
-                }
-                ec.clear();
-            }
+            check_user_titles(user.path() / "savedata", name);
         }
         ec.clear();
-        // The older layout <base>\savedata\<user>\CUSA00207 (BBport for Windows keeps its saves
+        // The older layout <base>\savedata\<user>\<title_id> (BBport keeps its saves
         // there, 2026-10-12); its users are named "sd<user>" so they never share a shadPS4 user's files.
         for (const auto& user : fs::directory_iterator(base / "savedata", ec)) {
             const std::string name = user.path().filename().string();
             if (name == "1004") {
                 continue;
             }
-            const fs::path dir = user.path() / "CUSA00207" / "SPRJ0005";
-            for (int slot = 0; slot < 10; ++slot) {
-                const fs::path file = dir / fmt::format("userdata{:04}", slot);
-                const auto written = fs::last_write_time(file, ec);
-                if (!ec && written > best_time) {
-                    best_time = written;
-                    best = BbscSaveSlot{"sd" + name, slot};
-                }
-                ec.clear();
-            }
+            check_user_titles(user.path(), "sd" + name);
         }
         ec.clear();
     }
@@ -10990,14 +10999,11 @@ u64 FindBbscMessageSlot(u32 category, u32 id, u64* fmg_out) {
     return 0;
 }
 
-void TickBbscMessages() {
-    static s64 last_ms = 0;
+void ApplyBbscMessages() {
     static size_t logged = 0;
-    const s64 now = SteadyNowMs();
-    if (image_base == 0 || !BbscMessagesEnabled() || now - last_ms < 2'000) {
+    if (image_base == 0 || !BbscMessagesEnabled()) {
         return;
     }
-    last_ms = now;
     size_t changed = 0;
     size_t in_place = 0;
     for (const auto& message : BbscMessages) {
@@ -11021,6 +11027,16 @@ void TickBbscMessages() {
                  changed + in_place, std::size(BbscMessages), changed);
         logged = in_place;
     }
+}
+
+void TickBbscMessages() {
+    static s64 last_ms = 0;
+    const s64 now = SteadyNowMs();
+    if (image_base == 0 || !BbscMessagesEnabled() || now - last_ms < 2'000) {
+        return;
+    }
+    last_ms = now;
+    ApplyBbscMessages();
 }
 
 // ---- Boss battle line with the boss's name (2026-10-07) -----------------------------------------
@@ -11792,13 +11808,34 @@ u64 BbscParamRow(u64 table, u32 id, size_t size = 8) {
 
 // min_rows / first_id: the table's row count must be above min_rows and its first row id first_id.
 std::vector<u64> FindBbscParamTables(std::string_view type, u16 min_rows = 1000,
-                                     u32 first_id = 0) {
+                                     u32 first_id = 0, bool scan_memory = true) {
+    std::vector<u64> tables;
+    const u64 repo =
+        image_base != 0 ? ReadValue<u64>(image_base + SoloParamRepositoryPointerOffset, 0) : 0;
+    if (ReadablePointer(repo, 64 * 0x48 + 0x38)) {
+        for (size_t idx = 0; idx < 64; ++idx) {
+            if (ReadValue<s32>(repo, idx * 0x48 + 0x28) <= 0) {
+                continue;
+            }
+            const u64 resource = ReadValue<u64>(repo, idx * 0x48 + 0x30);
+            const u64 holder = ReadablePointer(resource, 0x78) ? ReadValue<u64>(resource, 0x70) : 0;
+            const u64 table = ReadablePointer(holder, 0x78) ? ReadValue<u64>(holder, 0x70) : 0;
+            if (ReadablePointer(table, 0x60) && ReadGuestAscii(table + 0x0C, 32) == type &&
+                ReadValue<u16>(table, 0x0A) > min_rows && ReadValue<u32>(table, 0x40) == first_id &&
+                std::ranges::find(tables, table) == tables.end()) {
+                tables.push_back(table);
+            }
+        }
+    }
+    if (!scan_memory || !tables.empty()) {
+        return tables;
+    }
     std::vector<u8> needle(type.begin(), type.end());
     needle.push_back(0);
-    std::vector<u64> tables;
     for (const u64 hit : Core::Bbsc::FindInMemory(needle, BbscScanLow(), 0x10000000000ULL, 16)) {
         const u64 table = hit - 0x0C;
-        if (ReadValue<u16>(table, 0x0A) > min_rows && ReadValue<u32>(table, 0x40) == first_id) {
+        if (ReadValue<u16>(table, 0x0A) > min_rows && ReadValue<u32>(table, 0x40) == first_id &&
+            std::ranges::find(tables, table) == tables.end()) {
             tables.push_back(table);
         }
     }
@@ -12178,9 +12215,17 @@ void PrepareBbscKitRows(u64 table) {
     }
 }
 
-void PrepareBbscDuelBell() {
-    const auto goods_tables = FindBbscParamTables("EQUIP_PARAM_GOODS_ST", 100, 1);
-    const auto speffect_tables = FindBbscParamTables("SP_EFFECT_PARAM_ST");
+void PrepareBbscDuelBell(bool scan_memory = true) {
+    if (bbsc_duel_bell_ready.load(std::memory_order_acquire) && !scan_memory) {
+        return;
+    }
+    static std::mutex mutex;
+    std::scoped_lock lock{mutex};
+    if (bbsc_duel_bell_ready.load(std::memory_order_acquire) && !scan_memory) {
+        return;
+    }
+    const auto goods_tables = FindBbscParamTables("EQUIP_PARAM_GOODS_ST", 100, 1, scan_memory);
+    const auto speffect_tables = FindBbscParamTables("SP_EFFECT_PARAM_ST", 1000, 0, scan_memory);
     size_t goods = 0;
     std::vector<u64> effects;
     std::vector<u64> blanks;
@@ -12227,11 +12272,17 @@ void PrepareBbscDuelBell() {
         ++goods;
     }
     const bool ok = goods != 0 && !effects.empty();
-    LOG_INFO(Debug, "BBSC duel bell: goods {} in {} of {} table(s), SpEffect {} in {} table(s){}",
-             BbscDuelBellGoodsId, goods, goods_tables.size(), BbscDuelBellEffectId,
-             effects.size(), ok ? "" : " - NOT READY, no PvP bell");
-    // Review 2026-10-08: the game thread reads these vectors; they are filled only once, here, by
-    // this (scan) thread, and published by the ready flag - never replaced while being read.
+    if (scan_memory) {
+        static int not_ready_logs = 0;
+        if (ok || (++not_ready_logs % 5) == 0) {
+            LOG_INFO(Debug,
+                     "BBSC duel bell: goods {} in {} of {} table(s), SpEffect {} in {} table(s){}",
+                     BbscDuelBellGoodsId, goods, goods_tables.size(), BbscDuelBellEffectId,
+                     effects.size(), ok ? "" : " - NOT READY, no PvP bell");
+        }
+    }
+    // Review 2026-10-08: the game thread reads these vectors; they are filled only once, here,
+    // and published by the ready flag - never replaced while being read.
     if (ok && !bbsc_duel_bell_ready) {
         bbsc_duel_bell_effect_rows = std::move(effects);
         bbsc_blank_effect_rows = std::move(blanks);
@@ -12247,8 +12298,11 @@ void StartBbscDuelBell() {
     }
     std::thread{[] {
         for (int attempt = 0; attempt < 36 && !bbsc_duel_bell_ready; ++attempt) {
-            std::this_thread::sleep_for(std::chrono::seconds(5));
-            PrepareBbscDuelBell();
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            PrepareBbscDuelBell(false);
+        }
+        if (!bbsc_duel_bell_ready) {
+            PrepareBbscDuelBell(true);
         }
     }}.detach();
 }
@@ -12457,6 +12511,14 @@ bool BackupBbscSavesUnchecked() {
     std::vector<fs::path> bases;
     std::error_code ec;
     bases.push_back(fs::current_path(ec) / "user");
+    for (const char* env_name : {"BB_GPU_USER_DIR", "BB_USER_DIR"}) {
+        if (const char* env_val = std::getenv(env_name); env_val != nullptr && env_val[0]) {
+            const fs::path env_path(env_val);
+            if (std::ranges::find(bases, env_path) == bases.end()) {
+                bases.push_back(env_path);
+            }
+        }
+    }
 #ifdef _WIN32
     if (const char* appdata = std::getenv("APPDATA")) {
         bases.push_back(fs::path(appdata) / "shadPS4");
@@ -12468,15 +12530,22 @@ bool BackupBbscSavesUnchecked() {
                          fmt::format("before-duel-bell-{}",
                                      std::chrono::duration_cast<std::chrono::seconds>(stamp).count());
     std::vector<std::pair<fs::path, fs::path>> saves; // save folder, backup folder
+    const auto collect_titles = [&](const fs::path& parent, const std::string& prefix) {
+        std::error_code title_ec;
+        for (const auto& title : fs::directory_iterator(parent, title_ec)) {
+            if (fs::is_directory(title.path() / "SPRJ0005", ec)) {
+                saves.emplace_back(title.path(), out / prefix);
+            }
+            ec.clear();
+        }
+    };
     for (const fs::path& base : bases) {
         for (const auto& user : fs::directory_iterator(base / "home", ec)) {
-            saves.emplace_back(user.path() / "savedata" / "CUSA00207",
-                               out / ("home-" + user.path().filename().string()));
+            collect_titles(user.path() / "savedata", "home-" + user.path().filename().string());
         }
         ec.clear();
         for (const auto& user : fs::directory_iterator(base / "savedata", ec)) {
-            saves.emplace_back(user.path() / "CUSA00207",
-                               out / ("savedata-" + user.path().filename().string()));
+            collect_titles(user.path(), "savedata-" + user.path().filename().string());
         }
         ec.clear();
     }
@@ -12505,7 +12574,7 @@ bool BackupBbscSavesUnchecked() {
             continue;
         }
         fs::create_directories(target, ec);
-        fs::copy(game, target / "CUSA00207", fs::copy_options::recursive, ec);
+        fs::copy(game, target / game.filename(), fs::copy_options::recursive, ec);
         if (!ec) {
             ++copied;
             LOG_INFO(Debug, "BBSC duel bell: save backed up {} -> {}",
@@ -12524,16 +12593,25 @@ void TickBbscDuelBellGive() {
     static s64 last_ms = 0;
     static u64 checked_player = 0;
     const s64 now = SteadyNowMs();
-    if (!bbsc_duel_bell_ready || now - last_ms < 5'000) {
+    const u64 player = GetLocalPlayerCharacter();
+    const u64 global = GetGlobalState();
+    if (!ReadablePointer(player, 0x410) || !ReadablePointer(global, 0x1598) ||
+        ReadValue<u8>(global, 0x08) != 0) {
+        checked_player = 0;
+        return; // not in the game yet, or loading
+    }
+    if (player == checked_player || GetCharacterHp(player) <= 0) {
+        return; // already checked, or dead
+    }
+    if (now - last_ms < 1'000) {
         return;
     }
     last_ms = now;
-    const u64 player = GetLocalPlayerCharacter();
-    const u64 global = GetGlobalState();
-    if (player == checked_player || !ReadablePointer(player, 0x410) ||
-        GetCharacterHp(player) <= 0 || !ReadablePointer(global, 0x1598) ||
-        ReadValue<u8>(global, 0x08) != 0) {
-        return; // already checked, not in the game yet, dead, or loading
+    if (!bbsc_duel_bell_ready) {
+        PrepareBbscDuelBell(false);
+        if (!bbsc_duel_bell_ready) {
+            return;
+        }
     }
     const u64 carried = BbscCarriedInventory();
     const u64 storage = BbscStorageInventory();
@@ -12573,14 +12651,22 @@ void TickBbscDuelBellGive() {
         LOG_INFO(Debug, "BBSC kit: all carried or in storage, no vanilla bells left");
         return;
     }
-    if (!BackupBbscSaves()) {
-        LOG_WARNING(Debug, "BBSC kit: no save folder found to back up - nothing given or removed");
-        return;
+    static bool saves_backed_up = false;
+    if (!saves_backed_up) {
+        saves_backed_up = BackupBbscSaves();
+        if (!saves_backed_up) {
+            LOG_WARNING(Debug,
+                        "BBSC kit: no save folder found to back up yet - giving kit anyway");
+        }
     }
+    PrepareBbscDuelBell(false);
+    ApplyBbscMessages();
+    bool all_retired = true;
     for (const u32 id : Retired) {
         for (const u64 inventory : {carried, storage}) {
             if (BbscInventoryHas(inventory, 0x40000000u | id)) {
                 const bool gone = BbscInventoryRemove(inventory, 0x40000000u | id);
+                all_retired = all_retired && gone;
                 LOG_INFO(Debug, "BBSC kit: vanilla goods {} taken out of the {} ({})", id,
                          inventory == carried ? "carried items" : "storage box",
                          gone ? "gone" : "STILL THERE");
@@ -12614,6 +12700,9 @@ void TickBbscDuelBellGive() {
             notice += given == 1 ? u"\n" : u", ";
             notice += item->name;
         }
+    }
+    if (given == missing.size() && all_retired) {
+        checked_player = player;
     }
     if (given != 0) {
         BbscAnnounce(notice.c_str(), "kit given");
@@ -15314,6 +15403,7 @@ void InstallReverseEngineeringTrace() {
     InstallBbscQuitHook();
     InstallBbscDeathTraceHooks();
     InstallBbscBannerHook();
+    StartBbscDuelBell();
 }
 
 BbscPresence GetBbscPresence() {

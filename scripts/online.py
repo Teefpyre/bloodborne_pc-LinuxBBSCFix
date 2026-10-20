@@ -74,7 +74,7 @@ def summon_service(webapi):
     """True when a shadNet WebAPI answers Bloodborne's summon calls: the route exists there
     (an empty request is refused with 400), where other servers answer 404."""
     request = urllib.request.Request(webapi.rstrip('/') + '/summon_messenger/create', data=b'',
-                                     method='POST')
+                                     headers={'User-Agent': 'Bloodborne/01.09'}, method='POST')
     try:
         urllib.request.urlopen(request, timeout=4).close()
         return True
@@ -94,17 +94,19 @@ def write_overrides(user_dir, community, webapi, plain=False):
         return custom
     community = community_address(community)
     host = community.split('://', 1)[1]
-    overrides = {GAME_SERVER: community}
+    # Ensure explicit :20443 port as in Windows reference JSON
+    game_target = community if (':' in host) else f'{community}:20443'
+    overrides = {GAME_SERVER: game_target}
     if plain:
         # The shadPS4 0.20 module (BB_NET_GEN=20): the game server only; summons stay on shadNet.
-        print(f'Co-op: game server {community}', file=sys.stderr)
-    elif summon_service(webapi):
-        overrides.update({f'{scheme}://{host}:{COMMUNITY_API_PORT}/summon_messenger': webapi
-                          for scheme in ('https', 'http')})
-        print(f'Co-op: summon signs through {webapi}', file=sys.stderr)
+        print(f'Co-op: game server {game_target}', file=sys.stderr)
     else:
-        print(f'Co-op: {webapi} has no summon service; summon signs through {community}',
-              file=sys.stderr)
+        # Reference summon redirects from Seamless Hunt (thehuntersdream.com:18671 -> webapi)
+        for target in ('http://thehuntersdream.com:18671', 'https://thehuntersdream.com:18671',
+                       f'http://{host}:{COMMUNITY_API_PORT}', f'https://{host}:{COMMUNITY_API_PORT}'):
+            overrides[f'{target}/summon_messenger'] = webapi
+            overrides[target] = webapi
+        print(f'Co-op: summon signs through {webapi}', file=sys.stderr)
     path = user_dir / 'host_overrides.json'
     path.write_text(json.dumps(overrides, indent=2) + '\n', encoding='utf-8')
     return path
@@ -114,9 +116,13 @@ def check(server, webapi, community):
     """(name, address, ok, detail) for the game server, the shadNet server and its WebAPI."""
     results = []
     try:
-        with urllib.request.urlopen(community + ':20443/bb-eu/ss.info', timeout=6) as reply:
+        req = urllib.request.Request(community + ':20443/bb-eu/ss.info',
+                                     headers={'User-Agent': 'Bloodborne/01.09'})
+        with urllib.request.urlopen(req, timeout=6) as reply:
             reply.read(64)
         results.append(('game', community, True, ''))
+    except urllib.error.HTTPError:
+        results.append(('game', community, True, ''))  # the server answered
     except (OSError, ValueError) as error:
         results.append(('game', community, False, str(error)))
     host, _sep, port = server.rpartition(':')
@@ -126,7 +132,9 @@ def check(server, webapi, community):
     except (OSError, ValueError) as error:
         results.append(('shadnet', server, False, str(error)))
     try:
-        with urllib.request.urlopen(webapi.rstrip('/') + '/status', timeout=4) as reply:
+        req = urllib.request.Request(webapi.rstrip('/') + '/status',
+                                     headers={'User-Agent': 'Bloodborne/01.09'})
+        with urllib.request.urlopen(req, timeout=4) as reply:
             ok = b'"ok":true' in reply.read(512).replace(b' ', b'')
         results.append(('webapi', webapi, ok, '' if ok else 'not a shadNet server'))
     except (OSError, ValueError) as error:
@@ -204,6 +212,101 @@ def thd_sign_in(server, on_code, device='bbport', cancelled=lambda: False):
     raise ValueError('the code expired; try again')
 
 
+def create_shadnet_account(server, npid, password, email=''):
+    """Create a shadNet account on the server via the shadNet protocol (CommandType::Create).
+    Returns (True, '') on success, or (False, error_message) on failure."""
+    npid = str(npid or '').strip()
+    password = str(password or '')
+    if not npid:
+        return False, 'Online ID (NPID) cannot be empty'
+    if not password:
+        return False, 'Password cannot be empty'
+
+    server = str(server or '').strip() or SHADNET_SERVER
+    if ':' in server:
+        host, port_str = server.split(':', 1)
+        port = int(port_str)
+    else:
+        host, port = server, 31313
+
+    def varint(n):
+        res = b''
+        while n > 0x7f:
+            res += bytes([(n & 0x7f) | 0x80])
+            n >>= 7
+        res += bytes([n])
+        return res
+
+    def encode_str(tag, s):
+        b = s.encode('utf-8')
+        return bytes([(tag << 3) | 2]) + varint(len(b)) + b
+
+    def recv_exact(sock, n):
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                break
+            buf.extend(chunk)
+        return bytes(buf)
+
+    try:
+        sock = socket.create_connection((host, port), timeout=8)
+    except Exception as e:
+        return False, f'Cannot connect to {host}:{port}: {e}'
+
+    try:
+        sock.settimeout(8)
+        # 1. Read ServerInfo handshake
+        hdr = recv_exact(sock, 15)
+        if len(hdr) < 15 or hdr[0] != 3:  # PacketType::ServerInfo
+            sock.close()
+            return False, 'Server returned invalid ServerInfo handshake'
+        total_sz = int.from_bytes(hdr[3:7], 'little')
+        if total_sz > 15:
+            recv_exact(sock, total_sz - 15)
+
+        # 2. Build RegistrationRequest
+        proto = encode_str(1, npid) + encode_str(2, password)
+        if email:
+            proto += encode_str(4, email)
+        payload = len(proto).to_bytes(4, 'little') + proto
+
+        pkt = bytearray(15)
+        pkt[0] = 0  # PacketType::Request
+        pkt[1:3] = (2).to_bytes(2, 'little')  # CommandType::Create
+        pkt[3:7] = (15 + len(payload)).to_bytes(4, 'little')
+        pkt[7:15] = (1).to_bytes(8, 'little')
+        pkt += payload
+
+        sock.sendall(pkt)
+
+        # 3. Read Reply
+        reply_hdr = recv_exact(sock, 15)
+        if len(reply_hdr) < 15 or reply_hdr[0] != 1:  # PacketType::Reply
+            sock.close()
+            return False, 'No valid reply from server'
+        reply_total = int.from_bytes(reply_hdr[3:7], 'little')
+        reply_payload = recv_exact(sock, reply_total - 15) if reply_total > 15 else b''
+        sock.close()
+
+        err_code = reply_payload[0] if reply_payload else 1
+        if err_code == 0:
+            return True, 'Account created successfully on server!'
+        elif err_code == 11:
+            return False, f"Username '{npid}' is already taken on this server."
+        elif err_code == 13:
+            return False, 'Email is already used on this server.'
+        else:
+            return False, f'Server rejected registration (error code {err_code}).'
+    except Exception as e:
+        try:
+            sock.close()
+        except Exception:
+            pass
+        return False, f'Connection error: {e}'
+
+
 def write_thd_overrides(user_dir, community):
     """The host overrides file for this launch (the game's servers and play logs -> The Hunter's
     Dream); returns (path, base address). host_overrides.custom.json is used as it is."""
@@ -247,13 +350,25 @@ def bbsc_local_server():
     if mode in ('1', 'on', 'yes'):
         return host
     community = community_address(os.environ.get('BB_COMMUNITY_SERVER'))
-    if community.split('://', 1)[1] in ('127.0.0.1', 'localhost'):
+    comm_host = community.split('://', 1)[1].split(':')[0]
+    if comm_host in ('127.0.0.1', 'localhost'):
         return ''  # pointed at a local one already
     try:
-        with urllib.request.urlopen(community + ':20443/bb-eu/ss.info', timeout=5) as reply:
+        req = urllib.request.Request(community + ':20443/bb-eu/ss.info',
+                                     headers={'User-Agent': 'Bloodborne/01.09'})
+        with urllib.request.urlopen(req, timeout=5) as reply:
             reply.read(64)
         return ''
+    except urllib.error.HTTPError:
+        # An HTTP status reply (even 403 or 401) confirms the server is reachable and running.
+        return ''
     except (OSError, ValueError) as error:
+        try:
+            # Fallback: check if port 20443 is accepting TCP connections
+            socket.create_connection((comm_host, 20443), timeout=3).close()
+            return ''
+        except (OSError, ValueError):
+            pass
         print(f'Co-op: {community}:20443 does not answer ({error}): BBSC game server on this PC',
               file=sys.stderr)
         return host

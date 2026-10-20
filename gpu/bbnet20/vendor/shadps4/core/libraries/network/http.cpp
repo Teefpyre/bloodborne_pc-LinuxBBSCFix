@@ -246,7 +246,8 @@ struct HostOverrideTarget {
 std::unordered_map<std::string, HostOverrideTarget> ParseHostOverridesJson(
     const std::string& json_text);
 
-bool ApplyHostOverride(std::string& scheme, std::string& host, u16& port, bool& is_secure);
+bool ApplyHostOverride(std::string& scheme, std::string& host, u16& port, bool& is_secure,
+                       std::string_view path = {});
 
 // Populate a response object with the shape a transport-level failure produces:
 // no status line, no headers, no body. Used by the no-internet path.
@@ -371,12 +372,14 @@ static const HostOverrideState& GetHostOverrideState() {
 extern "C" bool bbthd_enabled();
 extern "C" void bbthd_add_game_headers(std::vector<std::pair<std::string, std::string>>* headers);
 
-bool ApplyHostOverride(std::string& scheme, std::string& host, u16& port, bool& is_secure) {
+bool ApplyHostOverride(std::string& scheme, std::string& host, u16& port, bool& is_secure,
+                       std::string_view path) {
     const auto& state = GetHostOverrideState();
     if (state.entries.empty()) {
         return false;
     }
     // Look up most-specific match first. Keys can be:
+    //   "scheme://host:port/path" - matches that endpoint and path prefix
     //   "scheme://host:port"  - matches that exact endpoint
     //   "host:port"           - matches host+port on any scheme
     //   "host"                - matches host on any scheme/port
@@ -384,12 +387,46 @@ bool ApplyHostOverride(std::string& scheme, std::string& host, u16& port, bool& 
     const std::string full_key = scheme + "://" + host + ":" + std::to_string(port);
     const std::string host_port_key = host + ":" + std::to_string(port);
 
-    auto it = state.entries.find(full_key);
-    if (it == state.entries.end()) {
-        it = state.entries.find(host_port_key);
+    auto find_path_prefix = [&](const std::string& endpoint) {
+        auto best = state.entries.end();
+        std::size_t best_prefix_size = 0;
+        if (path.empty()) {
+            return best;
+        }
+        for (auto candidate = state.entries.begin(); candidate != state.entries.end();
+             ++candidate) {
+            const std::string& key = candidate->first;
+            if (key.size() <= endpoint.size() || !key.starts_with(endpoint) ||
+                key[endpoint.size()] != '/') {
+                continue;
+            }
+            const std::string_view prefix{key.data() + endpoint.size(),
+                                          key.size() - endpoint.size()};
+            if (!path.starts_with(prefix)) {
+                continue;
+            }
+            const bool boundary_match =
+                path.size() == prefix.size() || prefix.ends_with('/') || path[prefix.size()] == '/';
+            if (boundary_match && prefix.size() > best_prefix_size) {
+                best = candidate;
+                best_prefix_size = prefix.size();
+            }
+        }
+        return best;
+    };
+
+    auto it = state.entries.end();
+    for (const std::string& key : {full_key, host_port_key, host}) {
+        if ((it = find_path_prefix(key)) != state.entries.end()) {
+            break;
+        }
     }
     if (it == state.entries.end()) {
-        it = state.entries.find(host);
+        for (const std::string& key : {full_key, host_port_key, host}) {
+            if ((it = state.entries.find(key)) != state.entries.end()) {
+                break;
+            }
+        }
     }
     if (it == state.entries.end()) {
         // bbport: "*.example.com" matches every host under it.
@@ -1432,7 +1469,8 @@ int PS4_SYSV_ABI sceHttpCreateConnectionWithURL(int tmplId, const char* url, boo
     scheme_str = is_secure ? "https" : "http";
     u16 port = parsed.port;
     std::string host_str = parsed.hostname;
-    ApplyHostOverride(scheme_str, host_str, port, is_secure);
+    ApplyHostOverride(scheme_str, host_str, port, is_secure,
+                      parsed.path ? std::string_view{parsed.path} : std::string_view{"/"});
 
     std::lock_guard<std::mutex> lock(g_state.m_mutex);
     if (!g_state.inited) {
@@ -1700,21 +1738,23 @@ bool EnvFlagEnabled(const char* name) {
 }
 
 bool IsBloodborneSummonPath(std::string_view path) {
-    return path.find("/summon_messenger/") != std::string_view::npos;
+    return path.find("/summon_messenger/") != std::string_view::npos ||
+           path.starts_with("/summon_messenger") ||
+           path == "/create" || path == "/get" || path == "/request" || path == "/delete";
 }
 
 constexpr std::string_view BloodborneHostPlacementHeader = "X-ShadPS4-Bloodborne-Host-Placement";
 
 bool IsBloodborneSummonRequestPath(std::string_view path) {
-    return path.find("/summon_messenger/request") != std::string_view::npos;
+    return path.find("/summon_messenger/request") != std::string_view::npos || path == "/request";
 }
 
 bool IsBloodborneSummonSearchPath(std::string_view path) {
-    return path.find("/summon_messenger/get") != std::string_view::npos;
+    return path.find("/summon_messenger/get") != std::string_view::npos || path == "/get";
 }
 
 bool IsBloodborneSummonCreatePath(std::string_view path) {
-    return path.find("/summon_messenger/create") != std::string_view::npos;
+    return path.find("/summon_messenger/create") != std::string_view::npos || path == "/create";
 }
 
 std::optional<std::string_view> FindResponseHeader(std::string_view headers,
@@ -1878,8 +1918,12 @@ void ClearStaleSeamlessSummonRecord(const SendRequestPlan& plan) {
 
     SendRequestPlan removal = plan;
     const auto create_pos = removal.path.find("/summon_messenger/create");
-    removal.path.replace(create_pos, std::string_view{"/summon_messenger/create"}.size(),
-                         "/summon_messenger/delete");
+    if (create_pos != std::string::npos) {
+        removal.path.replace(create_pos, std::string_view{"/summon_messenger/create"}.size(),
+                             "/summon_messenger/delete");
+    } else if (removal.path == "/create") {
+        removal.path = "/delete";
+    }
     const std::string body = nlohmann::json{{"MessageId", "SummonDataRemoveRequest"},
                                             {"SessionId", session_id},
                                             {"UserId", user_id},

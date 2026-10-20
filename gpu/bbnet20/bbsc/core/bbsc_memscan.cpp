@@ -11,8 +11,14 @@
 #include <cstdio>
 #include <cstring>
 #ifndef _WIN32
+#include <cerrno>
 #include <sys/uio.h>
 #include <unistd.h>
+
+extern "C" int runtime_memory_region(std::uintptr_t address, std::uintptr_t* start,
+                                     std::uintptr_t* end, int* mapped);
+extern "C" void runtime_memory_read_backing(std::uintptr_t address, void* data,
+                                            std::uint64_t size);
 #endif
 
 namespace Core::Bbsc {
@@ -73,52 +79,88 @@ std::vector<std::uint64_t> FindInMemory(std::span<const std::uint8_t> needle, st
         at = end;
     }
 #else
-    // bbport (Linux): readable mappings from /proc/self/maps, copied in pieces with
-    // process_vm_readv on this process: a page the port protects meanwhile (its write and read
-    // traps) only fails that copy instead of faulting.
-    if (needle.empty()) {
-        return hits;
-    }
-    FILE* maps = std::fopen("/proc/self/maps", "r");
-    if (!maps) {
+    if (needle.empty() || lo >= hi) {
         return hits;
     }
     constexpr std::size_t Piece = 1u << 20;
     std::vector<std::uint8_t> buffer(Piece + needle.size());
-    char line[512];
-    while (hits.size() < max_hits && std::fgets(line, sizeof(line), maps)) {
-        unsigned long long start = 0, end = 0;
-        char perms[5] = {};
-        if (std::sscanf(line, "%llx-%llx %4s", &start, &end, perms) != 3 || perms[0] != 'r') {
-            continue;
+    constexpr std::uint64_t GuestMin = 0x1000000000ULL;
+    auto match_chunk = [&](std::uint64_t base, std::size_t len) {
+        const std::uint8_t* data = buffer.data();
+        const std::uint8_t* last = data + len - needle.size();
+        for (const std::uint8_t* p = data; p <= last && hits.size() < max_hits; ++p) {
+            p = static_cast<const std::uint8_t*>(
+                std::memchr(p, needle[0], std::size_t(last - p) + 1));
+            if (!p) {
+                break;
+            }
+            if (std::size_t(p - data) < Piece &&
+                std::memcmp(p, needle.data(), needle.size()) == 0) {
+                hits.push_back(base + std::uint64_t(p - data));
+            }
         }
-        start = std::max<unsigned long long>(start, lo);
-        end = std::min<unsigned long long>(end, hi);
-        for (std::uint64_t at = start; at < end && hits.size() < max_hits; at += Piece) {
-            const std::size_t want =
-                std::size_t(std::min<std::uint64_t>(end - at, Piece + needle.size() - 1));
-            iovec local{buffer.data(), want};
-            iovec remote{reinterpret_cast<void*>(at), want};
-            const ssize_t got = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
-            if (got < ssize_t(needle.size())) {
-                continue;
-            }
-            const std::uint8_t* data = buffer.data();
-            const std::uint8_t* last = data + got - needle.size();
-            for (const std::uint8_t* p = data; p <= last && hits.size() < max_hits; ++p) {
-                p = static_cast<const std::uint8_t*>(
-                    std::memchr(p, needle[0], std::size_t(last - p) + 1));
-                if (!p) {
-                    break;
+    };
+
+    // Low mappings below GuestMin (the eboot image): readable mappings from /proc/self/maps.
+    if (lo < GuestMin) {
+        const std::uint64_t low_hi = std::min<std::uint64_t>(hi, GuestMin);
+        if (FILE* maps = std::fopen("/proc/self/maps", "r")) {
+            char line[512];
+            while (hits.size() < max_hits && std::fgets(line, sizeof(line), maps)) {
+                unsigned long long start = 0, end = 0;
+                char perms[5] = {};
+                if (std::sscanf(line, "%llx-%llx %4s", &start, &end, perms) != 3 ||
+                    perms[0] != 'r') {
+                    continue;
                 }
-                // A match starting past this piece's own bytes is found by the next piece.
-                if (std::size_t(p - data) < Piece && std::memcmp(p, needle.data(), needle.size()) == 0) {
-                    hits.push_back(at + std::uint64_t(p - data));
+                start = std::max<unsigned long long>(start, lo);
+                end = std::min<unsigned long long>(end, low_hi);
+                for (std::uint64_t at = start; at < end && hits.size() < max_hits; at += Piece) {
+                    const std::size_t want =
+                        std::size_t(std::min<std::uint64_t>(end - at, Piece + needle.size() - 1));
+                    iovec local{buffer.data(), want};
+                    iovec remote{reinterpret_cast<void*>(at), want};
+                    ssize_t got = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+                    if (got < ssize_t(needle.size())) {
+                        if (errno == EPERM || errno == ENOSYS) {
+                            std::memcpy(buffer.data(), reinterpret_cast<const void*>(at), want);
+                            got = ssize_t(want);
+                        } else {
+                            continue;
+                        }
+                    }
+                    match_chunk(at, got);
                 }
             }
+            std::fclose(maps);
         }
     }
-    std::fclose(maps);
+    // Guest direct/flexible memory from GuestMin up: read through the runtime's backing view so
+    // GPU read/write page traps never split or block a region.
+    for (std::uint64_t at = std::max<std::uint64_t>(lo, GuestMin);
+         at < hi && hits.size() < max_hits;) {
+        std::uintptr_t r_start = 0, r_end = 0;
+        int mapped = 0;
+        if (!runtime_memory_region(at, &r_start, &r_end, &mapped) || r_end <= at) {
+            break;
+        }
+        if (!mapped) {
+            at = r_end;
+            continue;
+        }
+        const std::uint64_t start = std::max<std::uint64_t>(r_start, at);
+        const std::uint64_t end = std::min<std::uint64_t>(r_end, hi);
+        for (std::uint64_t chunk = start; chunk < end && hits.size() < max_hits; chunk += Piece) {
+            const std::size_t want =
+                std::size_t(std::min<std::uint64_t>(end - chunk, Piece + needle.size() - 1));
+            if (want < needle.size()) {
+                break;
+            }
+            runtime_memory_read_backing(chunk, buffer.data(), want);
+            match_chunk(chunk, want);
+        }
+        at = r_end;
+    }
 #endif
     return hits;
 }

@@ -221,14 +221,25 @@ fi
 if [[ ${BB_ONLINE:-0} == 1 && -f scripts/online.py ]]; then
     # The shadPS4 0.20 module (gpu/bbnet20) answers both pools: Seamless Hunt (shadNet with BBSC) and
     # The Hunter's Dream (BB_NET_BACKEND=thd, without BBSC). BB_NET_GEN=19: the older shadp2p module
-    # (gpu/bbnet) with BBSC, kept as a fallback.
-    export BB_NET_GEN=${BB_NET_GEN:-20}
+    # (gpu/bbnet) with BBSC, kept as the default for Seamless Hunt / BBSC wire compatibility.
+    export BB_NET_GEN=${BB_NET_GEN:-19}
     if [[ ${BB_NET_BACKEND:-} == thd ]]; then
         BB_NET_GEN=20
         unset BB_BBSC
+    else
+        export BB_BBSC=${BB_BBSC:-1}
     fi
-    if [[ $BB_NET_GEN == 20 && -z ${BB_NET_MODULE:-} ]]; then
-        if [[ -n ${BB_PREBUILT:-} ]]; then BB_NET_MODULE=$PWD/bin/gpu/libbbnet20.so; else BB_NET_MODULE=$PWD/out/gpu/libbbnet20.so; fi
+    if [[ -z ${BB_NET_MODULE:-} ]]; then
+        if [[ $BB_NET_GEN == 20 ]]; then
+            mod_lib="libbbnet20.so"
+        else
+            mod_lib="libbbnet.so"
+        fi
+        if [[ -n ${BB_PREBUILT:-} ]]; then
+            BB_NET_MODULE=$PWD/bin/gpu/$mod_lib
+        else
+            BB_NET_MODULE=$PWD/out/gpu/$mod_lib
+        fi
         export BB_NET_MODULE
     fi
     export BB_SHADNET_SERVER=${BB_SHADNET_SERVER:-play.seamlesshunt.com:31313}

@@ -497,17 +497,29 @@ extern "C" __attribute__((visibility("default"))) void bbnet_image_ready(std::ui
         return;
     }
     MemoryPatcher::g_game_serial = "CUSA03173";
+    Common::Singleton<PSF>::Instance()->app_ver = "01.09";
     // BBSC finds the save it backs up and journals in shadPS4's folders; the port's are
-    // <user>/savedata/<user id>/CUSA00207/SPRJ0005 (BBSC_SAVE_DIR: the folder of userdata0000..).
+    // <user>/savedata/<user id>/<title id>/SPRJ0005 (BBSC_SAVE_DIR: the folder of userdata0000..).
     if (!std::getenv("BBSC_SAVE_DIR")) {
         const char* user = std::getenv("BB_GPU_USER_DIR");
+        if (!user || !user[0]) {
+            user = std::getenv("BB_USER_DIR");
+        }
         std::error_code error;
+        bool found = false;
         for (const auto& id : std::filesystem::directory_iterator(
-                 std::filesystem::path(user ? user : "user") / "savedata", error)) {
-            const auto folder = id.path() / "CUSA00207" / "SPRJ0005";
-            if (std::filesystem::is_directory(folder, error)) {
-                setenv("BBSC_SAVE_DIR", folder.c_str(), 0);
-                std::printf("BBSC: save folder %s\n", folder.c_str());
+                 std::filesystem::path(user && user[0] ? user : "user") / "savedata", error)) {
+            std::error_code title_ec;
+            for (const auto& title : std::filesystem::directory_iterator(id.path(), title_ec)) {
+                const auto folder = title.path() / "SPRJ0005";
+                if (std::filesystem::is_directory(folder, error)) {
+                    setenv("BBSC_SAVE_DIR", folder.c_str(), 0);
+                    std::printf("BBSC: save folder %s\n", folder.c_str());
+                    found = true;
+                    break;
+                }
+            }
+            if (found) {
                 break;
             }
         }
